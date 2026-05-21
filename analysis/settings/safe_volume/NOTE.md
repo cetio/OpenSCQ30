@@ -1,0 +1,1 @@
+The initial state packet (initial.rs) uses Limit High Volume enabled with a 90dB limit and realtime refresh rate. limit_high_volume.rs contains the packet with it DISABLED, not ENABLED. refresh_10s.rs and refresh_1min.rs alter the refresh rate from realtime to 10 seconds and 1 minute respectively.

@@ -1,0 +1,1 @@
+The initial state packet (initial.rs) uses Preference Test as the preset.

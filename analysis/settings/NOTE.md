@@ -1,0 +1,1 @@
+The initial state packet (initial.rs) uses Adaptive Leakage Compensation enabled. adaptive_leakage_compensation.rs contains the packet with it DISABLED, not ENABLED.
