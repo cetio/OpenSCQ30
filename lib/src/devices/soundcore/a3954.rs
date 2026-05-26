@@ -9,6 +9,7 @@ use crate::devices::soundcore::{
     },
 };
 
+mod info;
 mod packets;
 mod state;
 mod structures;
@@ -20,12 +21,12 @@ soundcore_device!(
     },
     async |builder| {
         builder.module_collection().add_state_update();
+        builder.module_collection().add_a3954_info();
         builder.limit_high_volume();
+        builder.wearing_detection();
         builder.serial_number_and_dual_firmware_version();
         builder.tws_status();
         builder.dual_battery(5);
-        builder.sound_leak_compensation();
-        builder.wearing_detection();
     },
     {
         HashMap::from([(

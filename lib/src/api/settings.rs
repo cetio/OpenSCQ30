@@ -142,6 +142,15 @@ pub enum SettingId {
     Ldac,
     DualConnections,
     DualConnectionsDevices,
+    WindNoiseReduction,
+    AirplaneAdaptive,
+    AdaptiveMode,
+    AdaptiveLeakageCompensation,
+    SpatialAudio,
+    SpatialAudioProfile,
+    HeadTracking,
+    HearIdActive,
+    ChargingCaseFirmwareVersion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

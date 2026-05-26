@@ -4,7 +4,6 @@ use nom::{
     bytes::complete::take,
     combinator::{all_consuming, map},
     error::{ContextError, ParseError, context},
-    number::complete::le_u8,
 };
 use tokio::sync::watch;
 
@@ -13,7 +12,7 @@ use crate::{
     devices::soundcore::{
         a3954::{
             state::A3954State,
-            structures::{AmbientSoundControl, EqualizerSettings},
+            structures::{A3954AmbientState, A3954SpatialState},
         },
         common::{
             modules::ModuleCollection,
@@ -25,12 +24,46 @@ use crate::{
             },
             packet_manager::PacketHandler,
             structures::{
-                DualBattery, DualFirmwareVersion, FirmwareVersion, LimitHighVolume, SerialNumber,
-                SoundLeakCompensation, TwsStatus, WearingDetection,
+                AdaptiveLeakageCompensation, AdaptiveMode, DualBattery, DualFirmwareVersion,
+                LimitHighVolume, SerialNumber, TwsStatus, WearingDetection,
             },
         },
     },
 };
+
+// Layout of the 165-byte A3954 state body (zero-indexed):
+// 0..2   TwsStatus
+// 2..6   DualBattery
+// 6..16  DualFirmwareVersion (left + right)
+// 16..32 SerialNumber
+// 32..37 Charging case firmware version (ASCII "MM.mm")
+// 37..44 Opaque (7 bytes)
+// 44     Default preset selector
+// 45     Opaque
+// 46..54 8-band equalizer gains
+// 54..125 Opaque (71 bytes; HearID/buttons/etc.)
+// 125..129 A3954AmbientState (mode, intensity, airplane_adaptive, wind_noise_reduction)
+// 129..145 Opaque (16 bytes; includes init flag at 129)
+// 145..148 LimitHighVolume (enabled, db_limit, refresh_rate)
+// 148..151 A3954SpatialState (enabled, eq_or_head_tracking, submode)
+// 151     Opaque
+// 152     AdaptiveMode flag
+// 153     AdaptiveLeakageCompensation flag
+// 154..159 Opaque (5 bytes)
+// 159     WearingDetection flag
+// 160..163 Opaque (3 bytes)
+// 163..165 Trailer (0x11, 0x11)
+
+const CASE_FIRMWARE_LEN: usize = 5;
+const POST_SERIAL_OPAQUE_LEN: usize = 7;
+const POST_PRESET_OPAQUE_LEN: usize = 1;
+const EQUALIZER_BAND_COUNT: usize = 8;
+const POST_EQUALIZER_OPAQUE_LEN: usize = 71;
+const POST_AMBIENT_OPAQUE_LEN: usize = 16;
+const POST_SPATIAL_OPAQUE_LEN: usize = 1;
+const POST_LEAKAGE_OPAQUE_LEN: usize = 5;
+const POST_WEARING_OPAQUE_LEN: usize = 3;
+const TRAILER_LEN: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct A3954StateUpdatePacket {
@@ -38,23 +71,23 @@ pub struct A3954StateUpdatePacket {
     pub battery: DualBattery,
     pub dual_firmware_version: DualFirmwareVersion,
     pub serial_number: SerialNumber,
-    pub case_firmware_version: FirmwareVersion,
-    pub equalizer_settings: EqualizerSettings,
-    pub ambient_sound_control: AmbientSoundControl,
-    pub adaptive_mode: bool,
+    pub charging_case_firmware: [u8; CASE_FIRMWARE_LEN],
+    pub default_preset: u8,
+    pub equalizer_bands: [u8; EQUALIZER_BAND_COUNT],
+    pub ambient: A3954AmbientState,
     pub limit_high_volume: LimitHighVolume,
-    pub sound_leak_compensation: SoundLeakCompensation,
+    pub spatial: A3954SpatialState,
+    pub adaptive_mode: AdaptiveMode,
+    pub adaptive_leakage_compensation: AdaptiveLeakageCompensation,
     pub wearing_detection: WearingDetection,
-    unknown1: [u8; 7],
-    unknown2: [u8; 1],
-    unknown3: [u8; 1],
-    unknown4: [u8; 11],
-    unknown5: [u8; 57],
-    unknown6: [u8; 15],
-    unknown7: [u8; 1],
-    unknown8: [u8; 5],
-    unknown9: [u8; 3],
-    trailer: [u8; 2],
+    opaque_post_serial: [u8; POST_SERIAL_OPAQUE_LEN],
+    opaque_post_preset: [u8; POST_PRESET_OPAQUE_LEN],
+    opaque_post_equalizer: [u8; POST_EQUALIZER_OPAQUE_LEN],
+    opaque_post_ambient: [u8; POST_AMBIENT_OPAQUE_LEN],
+    opaque_post_spatial: [u8; POST_SPATIAL_OPAQUE_LEN],
+    opaque_post_leakage: [u8; POST_LEAKAGE_OPAQUE_LEN],
+    opaque_post_wearing: [u8; POST_WEARING_OPAQUE_LEN],
+    trailer: [u8; TRAILER_LEN],
 }
 
 impl Default for A3954StateUpdatePacket {
@@ -64,25 +97,34 @@ impl Default for A3954StateUpdatePacket {
             battery: Default::default(),
             dual_firmware_version: Default::default(),
             serial_number: Default::default(),
-            case_firmware_version: Default::default(),
-            equalizer_settings: Default::default(),
-            ambient_sound_control: AmbientSoundControl::default(),
-            adaptive_mode: false,
+            charging_case_firmware: *b"00.00",
+            default_preset: 0,
+            equalizer_bands: [120; EQUALIZER_BAND_COUNT],
+            ambient: Default::default(),
             limit_high_volume: Default::default(),
-            sound_leak_compensation: Default::default(),
+            spatial: Default::default(),
+            adaptive_mode: Default::default(),
+            adaptive_leakage_compensation: Default::default(),
             wearing_detection: Default::default(),
-            unknown1: [0u8; 7],
-            unknown2: [0u8; 1],
-            unknown3: [0u8; 1],
-            unknown4: [0u8; 11],
-            unknown5: [0u8; 57],
-            unknown6: [0u8; 15],
-            unknown7: [0u8; 1],
-            unknown8: [0u8; 5],
-            unknown9: [0u8; 3],
+            opaque_post_serial: [0; POST_SERIAL_OPAQUE_LEN],
+            opaque_post_preset: [0; POST_PRESET_OPAQUE_LEN],
+            opaque_post_equalizer: [0; POST_EQUALIZER_OPAQUE_LEN],
+            opaque_post_ambient: [0; POST_AMBIENT_OPAQUE_LEN],
+            opaque_post_spatial: [0; POST_SPATIAL_OPAQUE_LEN],
+            opaque_post_leakage: [0; POST_LEAKAGE_OPAQUE_LEN],
+            opaque_post_wearing: [0; POST_WEARING_OPAQUE_LEN],
             trailer: [0x11, 0x11],
         }
     }
+}
+
+fn take_array<'a, const N: usize, E: ParseError<&'a [u8]> + ContextError<&'a [u8]>>(
+    input: &'a [u8],
+) -> IResult<&'a [u8], [u8; N], E> {
+    map(take(N), |bytes: &[u8]| {
+        bytes.try_into().expect("take returns exactly N bytes")
+    })
+    .parse_complete(input)
 }
 
 impl FromPacketBody for A3954StateUpdatePacket {
@@ -100,31 +142,25 @@ impl FromPacketBody for A3954StateUpdatePacket {
                         DualBattery::take,
                         DualFirmwareVersion::take,
                         SerialNumber::take,
-                        FirmwareVersion::take,
-                        take(7usize),
-                        le_u8,
-                        take(1usize),
-                        take(8usize),
-                        take(1usize),
-                        le_u8,
-                        take(11usize),
-                        take_bool,
-                        take(57usize),
-                        AmbientSoundControl::take,
-                        take(15usize),
+                        take_array::<CASE_FIRMWARE_LEN, E>,
+                        take_array::<POST_SERIAL_OPAQUE_LEN, E>,
+                        map(nom::number::complete::le_u8, |value| value),
+                        take_array::<POST_PRESET_OPAQUE_LEN, E>,
+                        take_array::<EQUALIZER_BAND_COUNT, E>,
+                        take_array::<POST_EQUALIZER_OPAQUE_LEN, E>,
                     ),
                     (
+                        A3954AmbientState::take,
+                        take_array::<POST_AMBIENT_OPAQUE_LEN, E>,
                         LimitHighVolume::take,
-                        take_bool,
-                        le_u8,
-                        le_u8,
-                        take(1usize),
-                        take_bool,
-                        SoundLeakCompensation::take,
-                        take(5usize),
-                        WearingDetection::take,
-                        take(3usize),
-                        take(2usize),
+                        A3954SpatialState::take,
+                        take_array::<POST_SPATIAL_OPAQUE_LEN, E>,
+                        map(take_bool, AdaptiveMode),
+                        map(take_bool, AdaptiveLeakageCompensation),
+                        take_array::<POST_LEAKAGE_OPAQUE_LEN, E>,
+                        map(take_bool, WearingDetection),
+                        take_array::<POST_WEARING_OPAQUE_LEN, E>,
+                        take_array::<TRAILER_LEN, E>,
                     ),
                 ),
                 |(
@@ -133,97 +169,48 @@ impl FromPacketBody for A3954StateUpdatePacket {
                         battery,
                         dual_firmware_version,
                         serial_number,
-                        case_firmware_version,
-                        unknown1,
-                        preset_selector,
-                        unknown2,
-                        eq_gains,
-                        unknown3,
-                        hear_id_offset,
-                        unknown4,
-                        preference_test_active,
-                        unknown5,
-                        ambient_sound_control,
-                        unknown6,
+                        charging_case_firmware,
+                        opaque_post_serial,
+                        default_preset,
+                        opaque_post_preset,
+                        equalizer_bands,
+                        opaque_post_equalizer,
                     ),
                     (
+                        ambient,
+                        opaque_post_ambient,
                         limit_high_volume,
-                        spatial_audio,
-                        equalizer_type,
-                        preference_test_status,
-                        unknown7,
+                        spatial,
+                        opaque_post_spatial,
                         adaptive_mode,
-                        sound_leak_compensation,
-                        unknown8,
+                        adaptive_leakage_compensation,
+                        opaque_post_leakage,
                         wearing_detection,
-                        unknown9,
+                        opaque_post_wearing,
                         trailer,
                     ),
-                )| {
-                    let unknown1: [u8; 7] = unknown1
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown2: [u8; 1] = unknown2
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown3: [u8; 1] = unknown3
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let eq_gains: [u8; 8] = eq_gains
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown4: [u8; 11] = unknown4
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown5: [u8; 57] = unknown5
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown6: [u8; 15] = unknown6
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown7: [u8; 1] = unknown7
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown8: [u8; 5] = unknown8
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let unknown9: [u8; 3] = unknown9
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    let trailer: [u8; 2] = trailer
-                        .try_into()
-                        .expect("take returns exactly the requested length");
-                    Self {
-                        tws_status,
-                        battery,
-                        dual_firmware_version,
-                        serial_number,
-                        case_firmware_version,
-                        equalizer_settings: EqualizerSettings::new(
-                            preset_selector,
-                            eq_gains,
-                            hear_id_offset,
-                            preference_test_active,
-                            spatial_audio,
-                            equalizer_type,
-                            preference_test_status,
-                        ),
-                        ambient_sound_control,
-                        adaptive_mode,
-                        limit_high_volume,
-                        sound_leak_compensation,
-                        wearing_detection,
-                        unknown1,
-                        unknown2,
-                        unknown3,
-                        unknown4,
-                        unknown5,
-                        unknown6,
-                        unknown7,
-                        unknown8,
-                        unknown9,
-                        trailer,
-                    }
+                )| Self {
+                    tws_status,
+                    battery,
+                    dual_firmware_version,
+                    serial_number,
+                    charging_case_firmware,
+                    default_preset,
+                    equalizer_bands,
+                    ambient,
+                    limit_high_volume,
+                    spatial,
+                    adaptive_mode,
+                    adaptive_leakage_compensation,
+                    wearing_detection,
+                    opaque_post_serial,
+                    opaque_post_preset,
+                    opaque_post_equalizer,
+                    opaque_post_ambient,
+                    opaque_post_spatial,
+                    opaque_post_leakage,
+                    opaque_post_wearing,
+                    trailer,
                 },
             )),
         )
@@ -245,28 +232,22 @@ impl ToPacket for A3954StateUpdatePacket {
             .chain(self.battery.bytes())
             .chain(self.dual_firmware_version.bytes())
             .chain(self.serial_number.bytes())
-            .chain(self.case_firmware_version.bytes())
-            .chain(self.unknown1)
-            .chain([self.equalizer_settings.preset_selector])
-            .chain(self.unknown2)
-            .chain(self.equalizer_settings.gains)
-            .chain(self.unknown3)
-            .chain([self.equalizer_settings.hear_id_offset])
-            .chain(self.unknown4)
-            .chain([self.equalizer_settings.preference_test_active.into()])
-            .chain(self.unknown5)
-            .chain(self.ambient_sound_control.bytes())
-            .chain(self.unknown6)
+            .chain(self.charging_case_firmware)
+            .chain(self.opaque_post_serial)
+            .chain([self.default_preset])
+            .chain(self.opaque_post_preset)
+            .chain(self.equalizer_bands)
+            .chain(self.opaque_post_equalizer)
+            .chain(self.ambient.bytes())
+            .chain(self.opaque_post_ambient)
             .chain(self.limit_high_volume.bytes())
-            .chain([self.equalizer_settings.spatial_audio.into()])
-            .chain([self.equalizer_settings.equalizer_type])
-            .chain([self.equalizer_settings.preference_test_status])
-            .chain(self.unknown7)
-            .chain([self.adaptive_mode.into()])
-            .chain([self.sound_leak_compensation.0.into()])
-            .chain(self.unknown8)
-            .chain([self.wearing_detection.0.into()])
-            .chain(self.unknown9)
+            .chain(self.spatial.bytes())
+            .chain(self.opaque_post_spatial)
+            .chain([self.adaptive_mode.0 as u8])
+            .chain([self.adaptive_leakage_compensation.0 as u8])
+            .chain(self.opaque_post_leakage)
+            .chain([self.wearing_detection.0 as u8])
+            .chain(self.opaque_post_wearing)
             .chain(self.trailer)
             .collect()
     }
@@ -300,77 +281,130 @@ impl ModuleCollection<A3954State> {
 mod tests {
     use nom_language::error::VerboseError;
 
-    use crate::devices::soundcore::common::packet::inbound::TryToPacket;
+    use crate::devices::soundcore::{
+        a3954::structures::A3954AmbientMode,
+        common::packet::inbound::TryToPacket,
+    };
 
     use super::*;
 
     #[test]
-    fn serialize_and_deserialize() {
-        let bytes = A3954StateUpdatePacket::default()
-            .to_packet()
-            .bytes_with_checksum();
-        let (_, packet) = packet::Inbound::take_with_checksum::<VerboseError<_>>(&bytes).unwrap();
-        let _: A3954StateUpdatePacket = packet.try_to_packet().unwrap();
+    fn serialize_and_deserialize_default() {
+        let packet = A3954StateUpdatePacket::default();
+        let bytes = packet.to_packet().bytes_with_checksum();
+        let (_, parsed) =
+            packet::Inbound::take_with_checksum::<VerboseError<_>>(&bytes).unwrap();
+        let parsed: A3954StateUpdatePacket = parsed.try_to_packet().unwrap();
+        assert_eq!(packet, parsed);
     }
 
     #[test]
-    fn body_length_is_165() {
-        let body = A3954StateUpdatePacket::default().body();
-        assert_eq!(body.len(), 165);
+    fn default_body_length_is_165() {
+        assert_eq!(A3954StateUpdatePacket::default().body().len(), 165);
     }
 
-    #[test]
-    fn parse_initial_packet() {
-        let body = [
+    fn parse_body(body: &[u8]) -> A3954StateUpdatePacket {
+        let (_, packet) =
+            A3954StateUpdatePacket::take::<VerboseError<_>>(body).expect("parse");
+        packet
+    }
+
+    fn initial_body() -> Vec<u8> {
+        vec![
             1, 1, 98, 100, 0, 0, 48, 52, 46, 50, 57, 48, 52, 46, 50, 57, 51, 57, 53, 52, 51, 56,
             55, 52, 52, 70, 56, 65, 57, 68, 70, 52, 48, 50, 46, 53, 56, 9, 244, 157, 138, 64, 240,
-            11, 1, 0, 160, 130, 140, 140, 160, 160, 160, 140, 120, 60, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 0, 1, 180, 180, 180, 180, 180, 180, 180, 180, 180, 60, 180, 180,
-            180, 180, 180, 180, 180, 180, 180, 60, 0, 0, 0, 0, 0, 180, 119, 60, 118, 180, 180,
-            120, 179, 180, 60, 180, 119, 60, 118, 180, 180, 120, 179, 180, 60, 18, 0, 10, 102,
-            102, 50, 51, 255, 255, 68, 68, 51, 2, 6, 0, 0, 0, 0, 0, 1, 255, 0, 0, 0, 0, 98, 1, 49,
-            1, 1, 0, 1, 1, 2, 1, 90, 0, 0, 1, 2, 0, 0, 0, 1, 49, 1, 0, 1, 0, 0, 255, 0, 0, 17,
-            17,
-        ];
-        let (_, packet) = A3954StateUpdatePacket::take::<VerboseError<_>>(&body).unwrap();
-        assert_eq!(packet.case_firmware_version.to_string(), "02.58");
-        assert_eq!(packet.equalizer_settings.preset_selector, 1);
-        assert_eq!(
-            packet.equalizer_settings.gains,
-            [160, 130, 140, 140, 160, 160, 160, 140]
-        );
-        assert_eq!(packet.equalizer_settings.hear_id_offset, 60);
-        assert!(!packet.equalizer_settings.preference_test_active);
-        assert_eq!(packet.ambient_sound_control.ambient_mode as u8, 2);
-        assert_eq!(packet.ambient_sound_control.intensity, 6);
-        assert!(!packet.ambient_sound_control.airplane_adaptive);
-        assert!(!packet.ambient_sound_control.wind_noise_reduction);
-        assert_eq!(packet.ambient_sound_control.initialization_state, 0);
-        assert!(!packet.adaptive_mode);
-        assert_eq!(packet.limit_high_volume.enabled as u8, 1);
-        assert_eq!(packet.limit_high_volume.db_limit, 90);
-        assert_eq!(packet.limit_high_volume.refresh_rate as u8, 0);
-        assert!(!packet.equalizer_settings.spatial_audio);
-        assert_eq!(packet.equalizer_settings.equalizer_type, 1);
-        assert_eq!(packet.equalizer_settings.preference_test_status, 2);
-        assert!(packet.sound_leak_compensation.0);
-        assert!(!packet.wearing_detection.0);
+            11, 1, 0, 160, 130, 140, 140, 160, 160, 160, 140, 120, 60, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 0, 1, 180, 180, 180, 180, 180, 180, 180, 180, 180, 60, 180,
+            180, 180, 180, 180, 180, 180, 180, 180, 60, 0, 0, 0, 0, 0, 180, 119, 60, 118, 180,
+            180, 120, 179, 180, 60, 180, 119, 60, 118, 180, 180, 120, 179, 180, 60, 18, 0, 10,
+            102, 102, 50, 51, 255, 255, 68, 68, 51, 2, 6, 0, 0, 0, 1, 255, 0, 0, 0, 0, 98, 1, 49,
+            1, 1, 0, 1, 1, 2, 1, 90, 0, 0, 1, 2, 0, 0, 1, 49, 1, 0, 1, 0, 0, 255, 0, 0, 17, 17,
+        ]
     }
 
     #[test]
-    fn parse_anc_8_packet() {
+    fn parses_initial_capture() {
+        let body = initial_body();
+        assert_eq!(body.len(), 165);
+        let packet = parse_body(&body);
+        assert_eq!(packet.serial_number.to_string(), "395438744F8A9DF4");
+        assert_eq!(&packet.charging_case_firmware, b"02.58");
+        assert_eq!(packet.default_preset, 1);
+        assert_eq!(
+            packet.equalizer_bands,
+            [160, 130, 140, 140, 160, 160, 160, 140]
+        );
+        assert_eq!(packet.ambient.mode, A3954AmbientMode::Normal);
+        assert_eq!(packet.ambient.intensity, 6);
+        assert!(!packet.ambient.airplane_adaptive);
+        assert!(!packet.ambient.wind_noise_reduction);
+        assert!(packet.limit_high_volume.enabled);
+        assert_eq!(packet.limit_high_volume.db_limit, 90);
+        assert!(!packet.spatial.enabled);
+        assert_eq!(packet.spatial.eq_or_head_tracking, 1);
+        assert_eq!(packet.spatial.submode, 2);
+        assert!(!packet.adaptive_mode.0);
+        assert!(!packet.adaptive_leakage_compensation.0);
+        assert!(!packet.wearing_detection.0);
+        assert_eq!(packet.trailer, [0x11, 0x11]);
+    }
+
+    #[test]
+    fn parses_anc_capture() {
+        // analysis/anc/anc_8.rs: ANC level 8 stored as 9 (level + 1)
         let body = [
-            1, 1, 96, 100, 0, 0, 48, 52, 46, 50, 57, 48, 52, 46, 50, 57, 51, 57, 53, 52, 51, 56,
+            1u8, 1, 96, 100, 0, 0, 48, 52, 46, 50, 57, 48, 52, 46, 50, 57, 51, 57, 53, 52, 51, 56,
             55, 52, 52, 70, 56, 65, 57, 68, 70, 52, 48, 50, 46, 53, 56, 9, 244, 157, 138, 64, 240,
-            11, 1, 0, 160, 130, 140, 140, 160, 160, 160, 140, 120, 60, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 0, 1, 180, 180, 180, 180, 180, 180, 180, 180, 180, 60, 180, 180,
-            180, 180, 180, 180, 180, 180, 180, 60, 0, 0, 0, 0, 0, 180, 119, 60, 118, 180, 180,
-            120, 179, 180, 60, 180, 119, 60, 118, 180, 180, 120, 179, 180, 60, 0, 9, 0, 0, 0, 255,
-            255, 68, 68, 51, 2, 6, 0, 0, 0, 0, 0, 1, 255, 0, 0, 0, 0, 98, 1, 49, 1, 1, 0, 1, 1, 2,
-            1, 90, 0, 0, 1, 2, 0, 0, 0, 1, 49, 1, 0, 1, 0, 0, 255, 0, 0, 17, 17,
+            11, 1, 0, 160, 130, 140, 140, 160, 160, 160, 140, 120, 60, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 0, 1, 180, 180, 180, 180, 180, 180, 180, 180, 180, 60, 180,
+            180, 180, 180, 180, 180, 180, 180, 180, 60, 0, 0, 0, 0, 0, 180, 119, 60, 118, 180,
+            180, 120, 179, 180, 60, 180, 119, 60, 118, 180, 180, 120, 179, 180, 60, 18, 0, 10,
+            102, 102, 50, 51, 255, 255, 68, 68, 51, 0, 9, 0, 0, 255, 1, 255, 0, 0, 0, 0, 98, 1,
+            49, 1, 1, 0, 1, 1, 2, 1, 90, 0, 0, 1, 2, 0, 1, 1, 49, 1, 0, 1, 0, 0, 255, 0, 0, 17,
+            17,
         ];
-        let (_, packet) = A3954StateUpdatePacket::take::<VerboseError<_>>(&body).unwrap();
-        assert_eq!(packet.ambient_sound_control.ambient_mode as u8, 0);
-        assert_eq!(packet.ambient_sound_control.intensity, 9);
+        let packet = parse_body(&body);
+        assert_eq!(packet.ambient.mode, A3954AmbientMode::NoiseCanceling);
+        assert_eq!(packet.ambient.intensity, 9);
+        assert!(packet.adaptive_mode.0);
+    }
+
+    #[test]
+    fn parses_wind_reduction_capture() {
+        let body = [
+            1u8, 1, 95, 100, 0, 0, 48, 52, 46, 50, 57, 48, 52, 46, 50, 57, 51, 57, 53, 52, 51, 56,
+            55, 52, 52, 70, 56, 65, 57, 68, 70, 52, 48, 50, 46, 53, 56, 9, 244, 157, 138, 64, 240,
+            11, 1, 0, 160, 130, 140, 140, 160, 160, 160, 140, 120, 60, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 0, 1, 180, 180, 180, 180, 180, 180, 180, 180, 180, 60, 180,
+            180, 180, 180, 180, 180, 180, 180, 180, 60, 0, 0, 0, 0, 0, 180, 119, 60, 118, 180,
+            180, 120, 179, 180, 60, 180, 119, 60, 118, 180, 180, 120, 179, 180, 60, 18, 0, 10,
+            102, 102, 50, 51, 255, 255, 68, 68, 51, 2, 6, 0, 1, 255, 1, 255, 0, 0, 0, 0, 98, 1,
+            49, 1, 1, 0, 1, 1, 2, 1, 90, 0, 0, 2, 0, 0, 0, 1, 49, 1, 0, 1, 0, 0, 255, 0, 0, 17,
+            17,
+        ];
+        let packet = parse_body(&body);
+        assert!(packet.ambient.wind_noise_reduction);
+    }
+
+    #[test]
+    fn parses_wearing_detection_capture() {
+        let body = [
+            1u8, 1, 98, 100, 0, 0, 48, 52, 46, 50, 57, 48, 52, 46, 50, 57, 51, 57, 53, 52, 51, 56,
+            55, 52, 52, 70, 56, 65, 57, 68, 70, 52, 48, 50, 46, 53, 56, 9, 244, 157, 138, 64, 240,
+            11, 4, 0, 150, 150, 100, 100, 120, 140, 150, 160, 120, 60, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 0, 1, 180, 180, 180, 180, 180, 180, 180, 180, 180, 60, 180,
+            180, 180, 180, 180, 180, 180, 180, 180, 60, 0, 0, 0, 0, 0, 180, 119, 60, 118, 180,
+            180, 120, 179, 180, 60, 180, 119, 60, 118, 180, 180, 120, 179, 180, 60, 18, 0, 10,
+            102, 102, 50, 51, 255, 255, 68, 68, 51, 2, 6, 0, 0, 255, 1, 255, 0, 0, 0, 0, 98, 1,
+            49, 1, 1, 0, 1, 1, 2, 1, 90, 0, 0, 2, 0, 0, 0, 1, 49, 1, 0, 1, 0, 1, 255, 0, 0, 17,
+            17,
+        ];
+        let packet = parse_body(&body);
+        assert_eq!(packet.default_preset, 4);
+        assert_eq!(
+            packet.equalizer_bands,
+            [150, 150, 100, 100, 120, 140, 150, 160]
+        );
+        assert!(packet.wearing_detection.0);
     }
 }

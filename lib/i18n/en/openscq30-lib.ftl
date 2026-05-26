@@ -209,3 +209,20 @@ firmest = Firmest
 
 dual-connections = Dual Connections
 dual-connections-devices = Dual Connections Devices
+
+wind-noise-reduction = Wind Noise Reduction
+airplane-adaptive = Airplane Adaptive
+adaptive-mode = Adaptive Mode
+adaptive-leakage-compensation = Adaptive Leakage Compensation
+spatial-audio = Spatial Audio
+spatial-audio-profile = Spatial Audio Profile
+head-tracking = Head Tracking
+hear-id-active = HearID Active
+charging-case-firmware-version = Charging Case Firmware Version
+airplane = Airplane
+spatial-music = Spatial Music
+spatial-podcast = Spatial Podcast
+spatial-movie = Spatial Movie
+spatial-gaming = Spatial Gaming
+fixed = Fixed
+head-tracking-active = Head Tracking Active
