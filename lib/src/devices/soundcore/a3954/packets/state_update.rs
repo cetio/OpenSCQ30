@@ -344,7 +344,8 @@ mod tests {
         assert_eq!(packet.spatial.eq_or_head_tracking, 1);
         assert_eq!(packet.spatial.submode, 2);
         assert!(!packet.adaptive_mode.0);
-        assert!(!packet.adaptive_leakage_compensation.0);
+        // body[153] = 1 in initial capture
+        assert!(packet.adaptive_leakage_compensation.0);
         assert!(!packet.wearing_detection.0);
         assert_eq!(packet.trailer, [0x11, 0x11]);
     }
